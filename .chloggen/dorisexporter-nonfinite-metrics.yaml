@@ -1,0 +1,6 @@
+change_type: bug_fix
+component: exporter/doris
+note: Prevent metric export failures when datapoints contain non-finite floating-point values.
+issues: [50569]
+subtext:
+change_logs: [user]

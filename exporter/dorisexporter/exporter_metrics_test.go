@@ -6,7 +6,10 @@ package dorisexporter // import "github.com/open-telemetry/opentelemetry-collect
 import (
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -16,6 +19,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestPushMetricData(t *testing.T) {
@@ -75,6 +79,98 @@ func TestPushMetricData(t *testing.T) {
 	require.NoError(t, err0)
 
 	_ = server.Shutdown(ctx)
+}
+
+func TestPushMetricDataDropsNonFiniteDatapoint(t *testing.T) {
+	var requestBody []byte
+	var requestErr error
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestBody, requestErr = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"Status":"Success"}`))
+	}))
+	defer server.Close()
+
+	exporter := newTestMetricsExporter(t, server, zap.NewNop())
+
+	metrics := pmetric.NewMetrics()
+	scopeMetrics := metrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	metric := scopeMetrics.Metrics().AppendEmpty()
+	metric.SetName("gauge")
+	datapoints := metric.SetEmptyGauge().DataPoints()
+	datapoints.AppendEmpty().SetDoubleValue(math.NaN())
+	datapoints.AppendEmpty().SetDoubleValue(1)
+
+	err := exporter.pushMetricData(t.Context(), metrics)
+	require.NoError(t, err)
+	require.NoError(t, requestErr)
+	require.NotContains(t, string(requestBody), "NaN")
+	require.Contains(t, string(requestBody), `"value":1`)
+}
+
+func TestPushMetricDataPreservesNonFiniteDatapointForDoris4(t *testing.T) {
+	var requestBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"Status":"Success"}`))
+	}))
+	defer server.Close()
+
+	exporter := newTestMetricsExporter(t, server, zap.NewNop())
+	exporter.allowNonFinite = true
+
+	metrics := pmetric.NewMetrics()
+	scopeMetrics := metrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	metric := scopeMetrics.Metrics().AppendEmpty()
+	metric.SetName("gauge")
+	datapoint := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+	datapoint.SetDoubleValue(math.NaN())
+	datapoint.Attributes().PutDouble("attribute", math.Inf(1))
+	exemplar := datapoint.Exemplars().AppendEmpty()
+	exemplar.SetDoubleValue(math.Inf(-1))
+
+	require.NoError(t, exporter.pushMetricData(t.Context(), metrics))
+	require.Contains(t, string(requestBody), `"value":"NaN"`)
+	require.Contains(t, string(requestBody), `"attribute":"Infinity"`)
+	require.Contains(t, string(requestBody), `"value":"-Infinity"`)
+}
+
+func TestPushMetricDataAggregatesNonFiniteDrops(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"Status":"Success"}`))
+	}))
+	defer server.Close()
+
+	exporter := newTestMetricsExporter(t, server, zap.New(core))
+
+	metrics := pmetric.NewMetrics()
+	scopeMetrics := metrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+	metric := scopeMetrics.Metrics().AppendEmpty()
+	metric.SetName("gauge")
+	datapoints := metric.SetEmptyGauge().DataPoints()
+	datapoints.AppendEmpty().SetDoubleValue(math.NaN())
+	datapoints.AppendEmpty().SetDoubleValue(math.Inf(1))
+
+	require.NoError(t, exporter.pushMetricData(t.Context(), metrics))
+	require.Len(t, logs.All(), 1)
+	require.Equal(t, "dropped non-finite metric values", logs.All()[0].Message)
+	require.Equal(t, int64(2), logs.All()[0].ContextMap()["datapoints"])
+}
+
+func newTestMetricsExporter(t *testing.T, server *httptest.Server, logger *zap.Logger) *metricsExporter {
+	t.Helper()
+	config := createDefaultConfig().(*Config)
+	config.ClientConfig.Endpoint = server.URL
+	config.CreateSchema = false
+	require.NoError(t, config.Validate())
+
+	exporter := newMetricsExporter(logger, config, componenttest.NewNopTelemetrySettings())
+	exporter.client = server.Client()
+	return exporter
 }
 
 func simpleMetrics(count int, typeSet map[pmetric.MetricType]struct{}) pmetric.Metrics {

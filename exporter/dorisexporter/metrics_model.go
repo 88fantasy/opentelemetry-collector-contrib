@@ -8,7 +8,7 @@ import "go.opentelemetry.io/collector/pdata/pmetric"
 type metricModel interface {
 	metricType() pmetric.MetricType
 	tableSuffix() string
-	add(pm pmetric.Metric, dm *dMetric, e *metricsExporter) error
+	add(pm pmetric.Metric, dm *dMetric, e *metricsExporter, stats *metricDropStats) error
 	size() int
 	bytes() ([]byte, error)
 	label() string
@@ -47,7 +47,7 @@ type dMetric struct {
 type dExemplar struct {
 	FilteredAttributes map[string]any `json:"filtered_attributes"`
 	Timestamp          string         `json:"timestamp"`
-	Value              float64        `json:"value"`
+	Value              any            `json:"value"`
 	SpanID             string         `json:"span_id"`
 	TraceID            string         `json:"trace_id"`
 }

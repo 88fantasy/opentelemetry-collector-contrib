@@ -31,6 +31,8 @@ var metricsView string
 
 type metricsExporter struct {
 	*commonExporter
+
+	allowNonFinite bool
 }
 
 func newMetricsExporter(logger *zap.Logger, cfg *Config, set component.TelemetrySettings) *metricsExporter {
@@ -45,6 +47,13 @@ func (e *metricsExporter) start(ctx context.Context, host component.Host) error 
 		return err
 	}
 	e.client = client
+
+	version, err := detectDorisVersion(ctx, e.client, e.cfg)
+	if err != nil {
+		e.logger.Warn("unable to determine Doris version; dropping non-finite metric values", zap.Error(err))
+	} else {
+		e.allowNonFinite = version >= 4
+	}
 
 	if e.cfg.CreateSchema {
 		conn, err := createDorisMySQLClient(e.cfg)
@@ -169,6 +178,8 @@ func (e *metricsExporter) initMetricMap(ms pmetric.Metrics) map[pmetric.MetricTy
 
 func (e *metricsExporter) pushMetricData(ctx context.Context, md pmetric.Metrics) error {
 	metricMap := e.initMetricMap(md)
+	dropStats := &metricDropStats{}
+	defer dropStats.log(e.logger)
 
 	for i := 0; i < md.ResourceMetrics().Len(); i++ {
 		resourceMetric := md.ResourceMetrics().At(i)
@@ -191,23 +202,24 @@ func (e *metricsExporter) pushMetricData(ctx context.Context, md pmetric.Metrics
 			for k := 0; k < scopeMetric.Metrics().Len(); k++ {
 				metric := scopeMetric.Metrics().At(k)
 
+				encodedResourceAttributes, _ := encodeJSONValue(resourceAttributes.AsRaw(), true)
+				resourceAttributesMap, _ := encodedResourceAttributes.(map[string]any)
 				dm := &dMetric{
 					ServiceName:        serviceName,
 					ServiceInstanceID:  serviceInstance,
 					MetricName:         metric.Name(),
 					MetricDescription:  metric.Description(),
 					MetricUnit:         metric.Unit(),
-					ResourceAttributes: resourceAttributes.AsRaw(),
+					ResourceAttributes: resourceAttributesMap,
 					ScopeName:          scopeMetric.Scope().Name(),
 					ScopeVersion:       scopeMetric.Scope().Version(),
 				}
-
 				metricM, ok := metricMap[metric.Type()]
 				if !ok {
 					return fmt.Errorf("invalid metric type: %v", metric.Type().String())
 				}
 
-				err := metricM.add(metric, dm, e)
+				err := metricM.add(metric, dm, e, dropStats)
 				if err != nil {
 					return err
 				}
@@ -288,33 +300,33 @@ func (e *metricsExporter) pushMetricDataInternal(ctx context.Context, metrics me
 	return fmt.Errorf("failed to push metric data, response:%s", string(body))
 }
 
-func (e *metricsExporter) getNumberDataPointValue(dp pmetric.NumberDataPoint) float64 {
+func (e *metricsExporter) getNumberDataPointValue(dp pmetric.NumberDataPoint) (any, bool) {
 	switch dp.ValueType() {
 	case pmetric.NumberDataPointValueTypeInt:
-		return float64(dp.IntValue())
+		return float64(dp.IntValue()), true
 	case pmetric.NumberDataPointValueTypeDouble:
-		return dp.DoubleValue()
+		return encodeFloat64(dp.DoubleValue(), e.allowNonFinite)
 	case pmetric.NumberDataPointValueTypeEmpty:
 		e.logger.Warn("data point value type is unset, use 0.0 as default")
-		return 0.0
+		return 0.0, true
 	default:
 		e.logger.Warn("data point value type is invalid, use 0.0 as default")
-		return 0.0
+		return 0.0, true
 	}
 }
 
-func (e *metricsExporter) getExemplarValue(ep pmetric.Exemplar) float64 {
+func (e *metricsExporter) getExemplarValue(ep pmetric.Exemplar) (any, bool) {
 	switch ep.ValueType() {
 	case pmetric.ExemplarValueTypeInt:
-		return float64(ep.IntValue())
+		return float64(ep.IntValue()), true
 	case pmetric.ExemplarValueTypeDouble:
-		return ep.DoubleValue()
+		return encodeFloat64(ep.DoubleValue(), e.allowNonFinite)
 	case pmetric.ExemplarValueTypeEmpty:
 		e.logger.Warn("exemplar value type is unset, use 0.0 as default")
-		return 0.0
+		return 0.0, true
 	default:
 		e.logger.Warn("exemplar value type is invalid, use 0.0 as default")
-		return 0.0
+		return 0.0, true
 	}
 }
 

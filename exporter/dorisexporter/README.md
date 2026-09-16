@@ -14,6 +14,8 @@
 
 This exporter supports sending traces, metrics, and logs data to [Apache Doris](https://doris.apache.org/) (version >= 2.1.1). 
 
+For metrics, the exporter checks every alive Doris BE at startup. On Doris 4.0 and later, non-finite core floating-point values are encoded as strings (`NaN`, `Infinity`, and `-Infinity`). For older, mixed, or unknown Doris versions, affected datapoints are dropped so the rest of the batch can still be exported. Non-finite attribute values are encoded as strings on all versions.
+
 ## Configuration
 
 The following configuration options are supported:

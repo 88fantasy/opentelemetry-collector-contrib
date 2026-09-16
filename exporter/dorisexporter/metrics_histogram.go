@@ -20,12 +20,12 @@ type dMetricHistogram struct {
 	Attributes             map[string]any `json:"attributes"`
 	StartTime              string         `json:"start_time"`
 	Count                  int64          `json:"count"`
-	Sum                    float64        `json:"sum"`
+	Sum                    any            `json:"sum"`
 	BucketCounts           []int64        `json:"bucket_counts"`
-	ExplicitBounds         []float64      `json:"explicit_bounds"`
+	ExplicitBounds         []any          `json:"explicit_bounds"`
 	Exemplars              []*dExemplar   `json:"exemplars"`
-	Min                    float64        `json:"min"`
-	Max                    float64        `json:"max"`
+	Min                    any            `json:"min"`
+	Max                    any            `json:"max"`
 	AggregationTemporality string         `json:"aggregation_temporality"`
 }
 
@@ -41,7 +41,7 @@ func (*metricModelHistogram) tableSuffix() string {
 	return "_histogram"
 }
 
-func (m *metricModelHistogram) add(pm pmetric.Metric, dm *dMetric, e *metricsExporter) error {
+func (m *metricModelHistogram) add(pm pmetric.Metric, dm *dMetric, e *metricsExporter, stats *metricDropStats) error {
 	if pm.Type() != pmetric.MetricTypeHistogram {
 		return fmt.Errorf("metric type is not histogram: %v", pm.Type().String())
 	}
@@ -50,20 +50,24 @@ func (m *metricModelHistogram) add(pm pmetric.Metric, dm *dMetric, e *metricsExp
 	for i := 0; i < dataPoints.Len(); i++ {
 		dp := dataPoints.At(i)
 
-		exemplars := dp.Exemplars()
-		newExemplars := make([]*dExemplar, 0, exemplars.Len())
-		for j := 0; j < exemplars.Len(); j++ {
-			exemplar := exemplars.At(j)
-
-			newExemplar := &dExemplar{
-				FilteredAttributes: exemplar.FilteredAttributes().AsRaw(),
-				Timestamp:          e.formatTime(exemplar.Timestamp().AsTime()),
-				Value:              e.getExemplarValue(exemplar),
-				SpanID:             exemplar.SpanID().String(),
-				TraceID:            exemplar.TraceID().String(),
-			}
-
-			newExemplars = append(newExemplars, newExemplar)
+		encodedAttributes, ok := encodeDataPointAttributes(dp.Attributes(), stats)
+		if !ok {
+			continue
+		}
+		sum, ok := encodeFloat64(dp.Sum(), e.allowNonFinite)
+		if !ok {
+			stats.datapoints++
+			continue
+		}
+		minValue, ok := encodeFloat64(dp.Min(), e.allowNonFinite)
+		if !ok {
+			stats.datapoints++
+			continue
+		}
+		maxValue, ok := encodeFloat64(dp.Max(), e.allowNonFinite)
+		if !ok {
+			stats.datapoints++
+			continue
 		}
 
 		bucketCounts := dp.BucketCounts()
@@ -72,24 +76,25 @@ func (m *metricModelHistogram) add(pm pmetric.Metric, dm *dMetric, e *metricsExp
 			newBucketCounts = append(newBucketCounts, int64(bucketCounts.At(j)))
 		}
 
-		explicitBounds := dp.ExplicitBounds()
-		newExplicitBounds := make([]float64, 0, explicitBounds.Len())
-		for j := 0; j < explicitBounds.Len(); j++ {
-			newExplicitBounds = append(newExplicitBounds, explicitBounds.At(j))
+		explicitBounds, ok := encodeJSONValue(dp.ExplicitBounds().AsRaw(), e.allowNonFinite)
+		if !ok {
+			stats.datapoints++
+			continue
 		}
+		encodedBounds, _ := explicitBounds.([]any)
 
 		metric := &dMetricHistogram{
 			dMetric:                dm,
 			Timestamp:              e.formatTime(dp.Timestamp().AsTime()),
-			Attributes:             dp.Attributes().AsRaw(),
+			Attributes:             encodedAttributes,
 			StartTime:              e.formatTime(dp.StartTimestamp().AsTime()),
 			Count:                  int64(dp.Count()),
-			Sum:                    dp.Sum(),
+			Sum:                    sum,
 			BucketCounts:           newBucketCounts,
-			ExplicitBounds:         newExplicitBounds,
-			Exemplars:              newExemplars,
-			Min:                    dp.Min(),
-			Max:                    dp.Max(),
+			ExplicitBounds:         encodedBounds,
+			Exemplars:              e.encodeExemplars(dp.Exemplars(), stats),
+			Min:                    minValue,
+			Max:                    maxValue,
 			AggregationTemporality: pm.Histogram().AggregationTemporality().String(),
 		}
 		m.data = append(m.data, metric)

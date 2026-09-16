@@ -19,7 +19,7 @@ type dMetricGauge struct {
 	Timestamp  string         `json:"timestamp"`
 	Attributes map[string]any `json:"attributes"`
 	StartTime  string         `json:"start_time"`
-	Value      float64        `json:"value"`
+	Value      any            `json:"value"`
 	Exemplars  []*dExemplar   `json:"exemplars"`
 }
 
@@ -35,7 +35,7 @@ func (*metricModelGauge) tableSuffix() string {
 	return "_gauge"
 }
 
-func (m *metricModelGauge) add(pm pmetric.Metric, dm *dMetric, e *metricsExporter) error {
+func (m *metricModelGauge) add(pm pmetric.Metric, dm *dMetric, e *metricsExporter, stats *metricDropStats) error {
 	if pm.Type() != pmetric.MetricTypeGauge {
 		return fmt.Errorf("metric type is not gauge: %v", pm.Type().String())
 	}
@@ -44,29 +44,23 @@ func (m *metricModelGauge) add(pm pmetric.Metric, dm *dMetric, e *metricsExporte
 	for i := 0; i < dataPoints.Len(); i++ {
 		dp := dataPoints.At(i)
 
-		exemplars := dp.Exemplars()
-		newExemplars := make([]*dExemplar, 0, exemplars.Len())
-		for j := 0; j < exemplars.Len(); j++ {
-			exemplar := exemplars.At(j)
-
-			newExemplar := &dExemplar{
-				FilteredAttributes: exemplar.FilteredAttributes().AsRaw(),
-				Timestamp:          e.formatTime(exemplar.Timestamp().AsTime()),
-				Value:              e.getExemplarValue(exemplar),
-				SpanID:             exemplar.SpanID().String(),
-				TraceID:            exemplar.TraceID().String(),
-			}
-
-			newExemplars = append(newExemplars, newExemplar)
+		value, ok := e.getNumberDataPointValue(dp)
+		if !ok {
+			stats.datapoints++
+			continue
+		}
+		encodedAttributes, ok := encodeDataPointAttributes(dp.Attributes(), stats)
+		if !ok {
+			continue
 		}
 
 		metric := &dMetricGauge{
 			dMetric:    dm,
 			Timestamp:  e.formatTime(dp.Timestamp().AsTime()),
-			Attributes: dp.Attributes().AsRaw(),
+			Attributes: encodedAttributes,
 			StartTime:  e.formatTime(dp.StartTimestamp().AsTime()),
-			Value:      e.getNumberDataPointValue(dp),
-			Exemplars:  newExemplars,
+			Value:      value,
+			Exemplars:  e.encodeExemplars(dp.Exemplars(), stats),
 		}
 		m.data = append(m.data, metric)
 	}
